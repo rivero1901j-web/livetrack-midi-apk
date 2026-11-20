@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>LiveTrack MIDI</title>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body {
+      margin: 0; padding: 14px; background: #121212; color: #ffffff;
+      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    }
+    #midiStatus {
+      background: #263238; color: #80cbc4; text-align: center;
+      padding: 10px; border-radius: 8px; font-weight: bold; font-size: 13px;
+      border: 1px solid #455a64;
+    }
+    .connected { background: #1b5e20 !important; color: #69f0ae !important; border-color: #2e7d32 !important; }
+    .card {
+      background: #1e1e1e; border-radius: 12px; padding: 18px 16px;
+      margin-top: 10px; text-align: center;
+    }
+    #trackNumber { color: #aaaaaa; font-size: 14px; }
+    #trackName {
+      font-size: 26px; font-weight: bold; margin: 8px 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #playState { color: #ffb74d; font-weight: bold; font-size: 16px; }
+
+    .progress-container { margin-top: 16px; width: 100%; }
+    #progressBar {
+      -webkit-appearance: none; width: 100%; height: 12px;
+      border-radius: 6px; background: #333333; outline: none; cursor: pointer;
+    }
+    #progressBar::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none; width: 24px; height: 24px;
+      border-radius: 50%; background: #69f0ae; cursor: pointer;
+    }
+    .time-row {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 15px; font-weight: bold; color: #e0e0e0;
+      margin-top: 8px; font-variant-numeric: tabular-nums;
+    }
+    #remainingLabel { color: #ffb74d; }
+
+    .learn-row {
+      display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1.1fr;
+      gap: 5px; margin-top: 10px; height: 36px;
+    }
+    button {
+      border: none; border-radius: 8px; color: white; font-weight: bold;
+      font-size: 13px; cursor: pointer; touch-action: manipulation;
+    }
+    button:active { opacity: 0.7; }
+    .btn-learn { background: #262626; color: #9e9e9e; font-size: 11px; border: 1px solid #3a3a3a; }
+    .btn-auto { background: #004d40; color: #80cbc4; font-size: 11px; border: 1px solid #00796b; }
+    .learning { background: #f57f17 !important; color: #000 !important; }
+    #btnLoad {
+      background: #2e7d32; width: 100%; height: 46px;
+      margin-top: 10px; font-size: 15px;
+    }
+    #playlist {
+      list-style: none; padding: 0; margin: 10px 0 0 0;
+      background: #1e1e1e; border-radius: 8px; overflow-y: auto; flex: 1;
+    }
+    #playlist li {
+      padding: 14px 16px; border-bottom: 1px solid #333;
+      font-size: 16px; color: #cccccc;
+    }
+    #playlist li.active {
+      background: #1b5e20; color: #ffffff; font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="midiStatus">Buscando controlador MIDI por USB OTG...</div>
+
+  <div class="card">
+    <div id="trackNumber">PISTA 0 / 0</div>
+    <div id="trackName">Carga tus canciones</div>
+    <div id="playState">DETENIDO</div>
+
+    <div class="progress-container">
+      <input type="range" id="progressBar" value="0" min="0" max="100" step="0.1" />
+      <div class="time-row">
+        <span id="currentTime">00:00</span>
+        <span><span id="totalTime">00:00</span> / <span id="remainingLabel">-00:00</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="learn-row">
+    <button class="btn-learn" id="learnPrev">1: Ant</button>
+    <button class="btn-learn" id="learnNext">2: Sig</button>
+    <button class="btn-learn" id="learnPlay">3: Play</button>
+    <button class="btn-learn" id="learnStop">4: Stop</button>
+    <button class="btn-auto" id="btnAutoMap">Auto 1-4</button>
+  </div>
+
+  <input type="file" id="fileInput" accept="audio/*" multiple style="display:none" />
+  <button id="btnLoad">+ Cargar / Cambiar Setlist</button>
+
+  <ul id="playlist"></ul>
+  <audio id="audioPlayer"></audio>
+
+  <script>
+    const audio = document.getElementById('audioPlayer');
+    const fileInput = document.getElementById('fileInput');
+    const playlistEl = document.getElementById('playlist');
+    const trackNumberEl = document.getElementById('trackNumber');
+    const trackNameEl = document.getElementById('trackName');
+    const playStateEl = document.getElementById('playState');
+    const midiStatusEl = document.getElementById('midiStatus');
+
+    const progressBar = document.getElementById('progressBar');
+    const currentTimeEl = document.getElementById('currentTime');
+    const totalTimeEl = document.getElementById('totalTime');
+    const remainingLabelEl = document.getElementById('remainingLabel');
+
+    let tracks = [];
+    let currentIndex = 0;
+    let lastTrigger = 0;
+    let learningTarget = null;
+    let autoStep = -1;
+    let isSeeking = false;
+
+    const stepKeys = ['prev', 'next', 'play', 'stop'];
+    const stepNames = ['1 (ANTERIOR)', '2 (SIGUIENTE)', '3 (PLAY / PAUSA)', '4 (STOP)'];
+    const stepBtns = ['learnPrev', 'learnNext', 'learnPlay', 'learnStop'];
+
+    let midiMap = JSON.parse(localStorage.getItem('liveTrackMidiMap')) || {
+      prev: null, next: null, play: null, stop: null
+    };
+
+    const defaultPresets = {
+      prev: ["176-20", "192-0", "176-1", "144-36"],
+      next: ["176-21", "192-1", "176-2", "144-37"],
+      play: ["176-22", "192-2", "176-3", "144-38"],
+      stop: ["176-23", "192-3", "176-4", "144-39"]
+    };
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open('LiveTrackSetlistDB', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('setlist');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function saveTracksOffline(fileList) {
+      const db = await openDB();
+      const items = [];
+      for (const f of fileList) {
+        const buf = await f.arrayBuffer();
+        items.push({ name: f.name, type: f.type, buffer: buf });
+      }
+      const tx = db.transaction('setlist', 'readwrite');
+      tx.objectStore('setlist').put(items, 'saved_tracks');
+    }
+
+    async function loadTracksOffline() {
+      try {
+        const db = await openDB();
+        const tx = db.transaction('setlist', 'readonly');
+        const req = tx.objectStore('setlist').get('saved_tracks');
+        req.onsuccess = () => {
+          const items = req.result;
+          if (items && items.length > 0) {
+            tracks = items.map(it => new File([it.buffer], it.name, { type: it.type }));
+            currentIndex = 0;
+            renderPlaylist();
+            loadTrack(0, false);
+          }
+        };
+      } catch (e) {}
+    }
+
+    function formatTime(seconds) {
+      if (isNaN(seconds) || seconds < 0) return "00:00";
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    audio.ontimeupdate = () => {
+      if (!isSeeking && audio.duration) {
+        const pct = (audio.currentTime / audio.duration) * 100;
+        progressBar.value = pct;
+        progressBar.style.background = `linear-gradient(to right, #69f0ae ${pct}%, #333333 ${pct}%)`;
+        currentTimeEl.textContent = formatTime(audio.currentTime);
+        remainingLabelEl.textContent = `-${formatTime(audio.duration - audio.currentTime)}`;
+      }
+    };
+
+    audio.onloadedmetadata = () => {
+      progressBar.value = 0;
+      progressBar.style.background = '#333333';
+      currentTimeEl.textContent = "00:00";
+      totalTimeEl.textContent = formatTime(audio.duration);
+      remainingLabelEl.textContent = `-${formatTime(audio.duration)}`;
+    };
+
+    progressBar.addEventListener('input', () => {
+      isSeeking = true;
+      if (audio.duration) {
+        const seekTo = (progressBar.value / 100) * audio.duration;
+        currentTimeEl.textContent = formatTime(seekTo);
+        remainingLabelEl.textContent = `-${formatTime(audio.duration - seekTo)}`;
+      }
+    });
+
+    progressBar.addEventListener('change', () => {
+      if (audio.duration) {
+        audio.currentTime = (progressBar.value / 100) * audio.duration;
+      }
+      isSeeking = false;
+    });
+
+    document.getElementById('btnLoad').onclick = () => fileInput.click();
+    fileInput.onchange = async (e) => {
+      const selected = Array.from(e.target.files);
+      if (selected.length > 0) {
+        tracks = selected;
+        currentIndex = 0;
+        renderPlaylist();
+        loadTrack(0, false);
+        await saveTracksOffline(selected);
+      }
+    };
+
+    function renderPlaylist() {
+      playlistEl.innerHTML = '';
+      tracks.forEach((file, idx) => {
+        const li = document.createElement('li');
+        li.textContent = `${idx + 1}. ${file.name.replace(/\.[^/.]+$/, "")}`;
+        if (idx === currentIndex) li.classList.add('active');
+        li.onclick = () => { currentIndex = idx; loadTrack(idx, false); };
+        playlistEl.appendChild(li);
+      });
+    }
+
+    function loadTrack(index, autoPlay) {
+      if (!tracks.length) return;
+      const file = tracks[index];
+      audio.src = URL.createObjectURL(file);
+      trackNumberEl.textContent = `PISTA ${index + 1} DE ${tracks.length}`;
+      trackNameEl.textContent = file.name.replace(/\.[^/.]+$/, "");
+      renderPlaylist();
+
+      if (autoPlay) {
+        audio.play();
+        setStatus("REPRODUCIENDO", "#69f0ae");
+      } else {
+        setStatus("LISTA PARA DISPARAR", "#ffb74d");
+      }
+    }
+
+    function togglePlay() {
+      if (!tracks.length) return;
+      if (audio.paused) {
+        audio.play();
+        setStatus("REPRODUCIENDO", "#69f0ae");
+      } else {
+        audio.pause();
+        setStatus("PAUSADA", "#ffd54f");
+      }
+    }
+
+    function stopTrack() {
+      if (!tracks.length) return;
+      audio.pause();
+      audio.currentTime = 0;
+      progressBar.value = 0;
+      progressBar.style.background = '#333333';
+      currentTimeEl.textContent = "00:00";
+      if (audio.duration) remainingLabelEl.textContent = `-${formatTime(audio.duration)}`;
+      setStatus("DETENIDA (00:00)", "#ff8a80");
+    }
+
+    function nextTrack() {
+      if (!tracks.length) return;
+      currentIndex = (currentIndex + 1) % tracks.length;
+      loadTrack(currentIndex, false);
+    }
+
+    function prevTrack() {
+      if (!tracks.length) return;
+      currentIndex = (currentIndex - 1 + tracks.length) % tracks.length;
+      loadTrack(currentIndex, false);
+    }
+
+    function setStatus(text, color) {
+      playStateEl.textContent = text;
+      playStateEl.style.color = color;
+    }
+
+    audio.onended = () => {
+      audio.currentTime = 0;
+      progressBar.value = 0;
+      progressBar.style.background = '#333333';
+      currentTimeEl.textContent = "00:00";
+      if (audio.duration) remainingLabelEl.textContent = `-${formatTime(audio.duration)}`;
+      setStatus("FINALIZADA (LISTA)", "#ffb74d");
+    };
+
+    function clearHighlights() {
+      document.querySelectorAll('.btn-learn, .btn-auto').forEach(b => b.classList.remove('learning'));
+    }
+
+    function startLearn(target, btnId) {
+      autoStep = -1;
+      clearHighlights();
+      learningTarget = target;
+      document.getElementById(btnId).classList.add('learning');
+      midiStatusEl.textContent = `Pisa el pedal para: ${target.toUpperCase()}...`;
+    }
+
+    document.getElementById('btnAutoMap').onclick = () => {
+      learningTarget = null;
+      autoStep = 0;
+      clearHighlights();
+      document.getElementById('btnAutoMap').classList.add('learning');
+      document.getElementById(stepBtns[0]).classList.add('learning');
+      midiStatusEl.textContent = `AUTO-MAP: Pisa el botón ${stepNames[0]}...`;
+    };
+
+    document.getElementById('learnPrev').onclick = () => startLearn('prev', 'learnPrev');
+    document.getElementById('learnNext').onclick = () => startLearn('next', 'learnNext');
+    document.getElementById('learnPlay').onclick = () => startLearn('play', 'learnPlay');
+    document.getElementById('learnStop').onclick = () => startLearn('stop', 'learnStop');
+
+    window.onAndroidMidiConnected = function(deviceName) {
+      midiStatusEl.textContent = `CONECTADO (USB): ${deviceName}`;
+      midiStatusEl.classList.add('connected');
+    };
+
+    window.onAndroidMidiDisconnected = function() {
+      midiStatusEl.textContent = "Enchufa un controlador MIDI por USB OTG...";
+      midiStatusEl.classList.remove('connected');
+    };
+
+    function matchesAction(action, signature) {
+      if (midiMap[action]) return midiMap[action] === signature;
+      return defaultPresets[action].includes(signature);
+    }
+
+    window.onAndroidMidiMessage = function(statusByte, data1, data2) {
+      const command = statusByte & 0xf0;
+      if (statusByte >= 0xF0) return;
+      if (command === 0x80) return;
+      if ((command === 0x90 || command === 0xB0) && data2 === 0) return;
+
+      const now = Date.now();
+      if (now - lastTrigger < 220) return;
+      lastTrigger = now;
+
+      const signature = `${command}-${data1}`;
+
+      if (autoStep >= 0 && autoStep < 4) {
+        const currentKey = stepKeys[autoStep];
+        midiMap[currentKey] = signature;
+        autoStep++;
+
+        clearHighlights();
+        if (autoStep < 4) {
+          document.getElementById('btnAutoMap').classList.add('learning');
+          document.getElementById(stepBtns[autoStep]).classList.add('learning');
+          midiStatusEl.textContent = `AUTO-MAP: Ahora pisa el botón ${stepNames[autoStep]}...`;
+        } else {
+          localStorage.setItem('liveTrackMidiMap', JSON.stringify(midiMap));
+          midiStatusEl.textContent = `¡4 botones mapeados en orden y guardados!`;
+          autoStep = -1;
+        }
+        return;
+      }
+
+      if (learningTarget) {
+        midiMap[learningTarget] = signature;
+        localStorage.setItem('liveTrackMidiMap', JSON.stringify(midiMap));
+        clearHighlights();
+        midiStatusEl.textContent = `¡Guardado ${learningTarget.toUpperCase()} = [${signature}]!`;
+        learningTarget = null;
+        return;
+      }
+
+      if (matchesAction('prev', signature)) return prevTrack();
+      if (matchesAction('next', signature)) return nextTrack();
+      if (matchesAction('play', signature)) return togglePlay();
+      if (matchesAction('stop', signature)) return stopTrack();
+    };
+
+    loadTracksOffline();
+  </script>
+</body>
+</html>
